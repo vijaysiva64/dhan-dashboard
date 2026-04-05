@@ -12,6 +12,8 @@ import requests
 import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
 
 CLIENT_ID    = os.environ.get("CLIENT_ID",    "YOUR_CLIENT_ID_HERE")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
@@ -224,8 +226,38 @@ SYMBOL_MAP = {
 }
 
 # ── FASTAPI APP ───────────────────────────────────────────────
-app = FastAPI(title="NSE Options API", version="3.0")
+app = FastAPI(title="NSE Options API", version="4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def _scheduled_auto_scan():
+    """Runs automatically at 9:09 AM every weekday."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(auto_gap_scan(
+            min_gap_pct=2.0,
+            capital=50000,
+            risk_pct=0.30,
+            fetch_ltp=True
+        ))
+        print(f"[AUTO] Gap scan completed at {datetime.datetime.now()}")
+    except Exception as e:
+        print(f"[AUTO] Gap scan failed: {e}")
+    finally:
+        loop.close()
+
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+scheduler.add_job(
+    _scheduled_auto_scan,
+    trigger="cron",
+    day_of_week="mon-fri",
+    hour=9,
+    minute=9,
+    second=0,
+)
+scheduler.start()
+print("[AUTO] Scheduler started — runs at 9:09 AM IST weekdays")
 
 # ── HTTP HELPER ───────────────────────────────────────────────
 def dhan_post(endpoint, body):
@@ -690,10 +722,10 @@ async def gap_scan(
 
     gap_up, gap_down, excluded, no_interval, low_liq = [], [], [], [], []
 
-    for sym, pm in premarket.items():
+    for sym, pm in (premarket or {}).items():
         pct = pm["PCT"]
         iep = pm["IEP"]
-        bh  = bhav.get(sym)
+        bh  = (bhav or {}).get(sym)
         if not bh:
             continue
 
@@ -952,10 +984,10 @@ async def auto_gap_scan(
     gap_up, gap_down, excluded, no_interval, low_liq = [], [], [], [], []
     date_str, prev_date = _prev_trading_day()
 
-    for sym, pm in premarket.items():
+    for sym, pm in (premarket or {}).items():
         pct = pm["PCT"]
         iep = pm["IEP"]
-        bh  = bhav.get(sym)
+        bh  = (bhav or {}).get(sym)
         if not bh:
             continue
 
@@ -1059,8 +1091,8 @@ async def auto_gap_scan(
         "scan_time":        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source":          "AUTO (NSE direct download)",
         "bhav_date":       prev_date.strftime("%Y-%m-%d"),
-        "bhav_symbols":    len(bhav),
-        "premarket_symbols": len(premarket),
+        "bhav_symbols":    len(bhav or {}),
+        "premarket_symbols": len(premarket or {}),
         "expiry_code":     expiry_code,
         "expiry_iso":      expiry_iso,
         "total_gap_up":    len(gap_up),
