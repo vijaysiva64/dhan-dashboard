@@ -1,4 +1,4 @@
-server = '''#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 dhan_api_server.py  —  NSE Options FastAPI Backend (FULL VERSION)
 Run: uvicorn dhan_api_server:app --reload --port 8000
@@ -363,16 +363,3 @@ def get_premarket(symbol: str, expiry: str):
         "key_support":        max_pe_row.get("strike", 0),
         "strikes":            result,
     }
-'''
-
-import ast, os
-ast.parse(server)
-print("✅ SYNTAX OK")
-
-os.makedirs(os.path.expanduser("~/output"), exist_ok=True)
-with open(os.path.expanduser("~/output/dhan_api_server.py"), "w") as f:
-    f.write(server)
-
-lines = server.count('\n')
-print(f"📏 {lines} lines")
-print("📦 Ready to download!")
