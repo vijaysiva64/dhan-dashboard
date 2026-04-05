@@ -5,9 +5,12 @@ Run: uvicorn dhan_api_server:app --reload --port 8000
 """
 
 import os
+import io
+import csv
+import time
 import requests
 import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 CLIENT_ID    = os.environ.get("CLIENT_ID",    "YOUR_CLIENT_ID_HERE")
@@ -447,3 +450,392 @@ def get_premarket(symbol: str, expiry: str):
         "key_support":    max_pe_row.get("strike", 0),
         "strikes": result,
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# GAP SCANNER
+# ══════════════════════════════════════════════════════════════════
+
+STRIKE_INTERVALS = {
+    "360ONE":10,"ABB":50,"APLAPOLLO":20,"AUBANK":10,"ADANIENSOL":10,
+    "ADANIENT":20,"ADANIGREEN":10,"ADANIPORTS":20,"ABCAPITAL":5,
+    "ALKEM":50,"AMBER":100,"AMBUJACEM":5,"ANGELONE":5,"APOLLOHOSP":50,
+    "ASHOKLEY":2.5,"ASIANPAINT":20,"ASTRAL":20,"AUROPHARMA":10,"DMART":50,
+    "AXISBANK":10,"BSE":50,"BAJAJ-AUTO":100,"BAJFINANCE":10,"BAJAJFINSV":20,
+    "BAJAJHLDNG":100,"BANDHANBNK":2.5,"BANKBARODA":2.5,"BANKINDIA":1,
+    "BDL":20,"BEL":5,"BHARATFORG":20,"BHEL":2.5,"BPCL":5,"BHARTIARTL":10,
+    "BIOCON":5,"BLUESTARCO":20,"BOSCHLTD":250,"BRITANNIA":50,"CGPOWER":10,
+    "CANBK":1,"CDSL":20,"CHOLAFIN":20,"CIPLA":10,"COALINDIA":2.5,
+    "COFORGE":20,"COLPAL":20,"CAMS":10,"CONCOR":5,"CROMPTON":2.5,
+    "CUMMINSIND":50,"DLF":10,"DABUR":5,"DALBHARAT":20,"DELHIVERY":5,
+    "DIVISLAB":50,"DIXON":100,"DRREDDY":10,"ETERNAL":5,"EICHERMOT":50,
+    "EXIDEIND":2.5,"NYKAA":2.5,"FORTIS":10,"GAIL":1,"GMRAIRPORT":1,
+    "GLENMARK":20,"GODREJCP":10,"GODREJPROP":20,"GRASIM":20,"HCLTECH":20,
+    "HDFCAMC":20,"HDFCBANK":5,"HDFCLIFE":10,"HAVELLS":10,"HEROMOTOCO":50,
+    "HINDALCO":10,"HAL":50,"HINDPETRO":5,"HINDUNILVR":20,"HINDZINC":5,
+    "POWERINDIA":250,"HUDCO":2.5,"ICICIBANK":10,"ICICIGI":20,"ICICIPRULI":5,
+    "IDFCFIRSTB":1,"ITC":2.5,"INDIANB":10,"IEX":1,"IOC":1,"IRFC":1,
+    "IREDA":1,"INDUSTOWER":5,"INDUSINDBK":10,"NAUKRI":20,"INFY":20,
+    "INOXWIND":2.5,"INDIGO":50,"JINDALSTEL":10,"JSWENERGY":5,"JSWSTEEL":10,
+    "JIOFIN":2.5,"JUBLFOOD":5,"KEI":50,"KALYANKJIL":5,"KAYNES":50,
+    "KFINTECH":20,"KOTAKBANK":2.5,"LTF":5,"LICHSGFIN":5,"LTM":50,"LT":20,
+    "LAURUSLABS":10,"LICI":5,"LODHA":10,"LUPIN":20,"M&M":50,
+    "MANAPPURAM":2.5,"MANKIND":20,"MARICO":5,"MARUTI":100,"MFSL":20,
+    "MAXHEALTH":10,"MAZDOCK":20,"MPHASIS":50,"MCX":20,"MUTHOOTFIN":50,
+    "NBCC":1,"NHPC":1,"NMDC":1,"NTPC":2.5,"NATIONALUM":2.5,"NESTLEIND":10,
+    "NUVAMA":20,"OBEROIRLTY":20,"ONGC":1,"OIL":5,"PAYTM":20,"OFSS":100,
+    "POLICYBZR":20,"PGEL":10,"PIIND":20,"PNBHOUSING":10,"PAGEIND":500,
+    "PATANJALI":5,"PERSISTENT":100,"PETRONET":2.5,"PIDILITIND":10,
+    "PPLPHARMA":2.5,"POLYCAB":100,"PFC":2.5,"POWERGRID":2.5,"PREMIERENE":10,
+    "PRESTIGE":20,"PNB":1,"RBLBANK":5,"RECLTD":2.5,"RVNL":5,"RELIANCE":10,
+    "SBICARD":10,"SBILIFE":20,"SHREECEM":250,"SRF":60,"SAMMAANCAP":2.5,
+    "MOTHERSON":1,"SHRIRAMFIN":10,"SIEMENS":50,"SOLARINDS":100,"SONACOMS":5,
+    "SBIN":5,"SAIL":1,"SUNPHARMA":10,"SUPREMEIND":50,"SUZLON":1,"SWIGGY":5,
+    "TATACOMM":10,"TATACONSUM":5,"TATAMOTORS":1,"TATASTEEL":1,"TATAPOWER":2,
+    "TCS":50,"TECHM":10,"TITAN":10,"TIINDIA":20,"TRENT":50,"TVSMOTOR":10,
+    "UBL":20,"UNITDSPR":10,"UPL":5,"VBL":5,"VEDL":5,"VOLTAS":20,
+    "WAAREEENER":50,"WIPRO":5,"YESBANK":1,"ZOMATO":5,"ZYDUSLIFE":10,
+    "IDEA":1,"NBCC":1,"NMDC":1,"PNB":1,"SUZLON":1,"TATASTEEL":1,
+    "HINDPETRO":5,"HCLTECH":20,"BPCL":5,"INDUSTOWER":5,"POLYCAB":100,
+    "DIXON":100,"TRENT":50,"INDHOTEL":5,"TIINDIA":20,
+    "TMPV":5,"BSE":50,"ANGELONE":5,"SHRIRAMFIN":10,"MARUTI":100,
+    "RECLTD":2.5,"BLUESTARCO":20,"KFINTECH":20,"DALBHARAT":20,
+    "INDIANB":10,"PNBHOUSING":10,"SWIGGY":5,"MUTHOOTFIN":50,
+    "MANAPPURAM":2.5,"ABCAPITAL":5,"SAMMAANCAP":2.5,"LTF":5,
+    "UNITDSPR":10,"BEL":5,"HINDZINC":5,"WAAREEENER":50,"CHOLAFIN":20,
+    "VBL":5,"AMBUJACEM":5,"IOC":1,"OFSS":100,"JUBLFOOD":5,
+    "LICHSGFIN":5,"COFORGE":20,"TATAPOWER":2,"HINDUNILVR":20,
+    "INFY":20,"GODREJPROP":20,"PETRONET":2.5,"EICHERMOT":50,
+    "COALINDIA":2.5,"POWERGRID":2.5,"NMDC":1,"RELIANCE":10,"DMART":50,
+}
+
+LOT_SIZES = {
+    "NIFTY":75,"BANKNIFTY":30,"FINNIFTY":40,"MIDCPNIFTY":75,
+    "RELIANCE":250,"SBIN":1500,"INFY":300,"TCS":150,"HDFCBANK":550,
+    "ICICIBANK":700,"TATAMOTORS":900,"WIPRO":1500,"AXISBANK":1200,
+    "BHARTIARTL":500,"BAJFINANCE":125,"KOTAKBANK":400,"SUNPHARMA":350,
+    "TATASTEEL":5500,"ITC":3200,"ONGC":1925,"NTPC":2700,"LT":150,
+    "MARUTI":75,"HCLTECH":300,"ADANIPORTS":1250,"ASIANPAINT":200,
+    "TECHM":500,"BPCL":1800,"HINDUNILVR":300,"COALINDIA":2700,
+    "POWERGRID":2700,"DLF":1650,"TITAN":375,"BAJAJFINSV":250,
+    "JSWSTEEL":1350,"HINDALCO":2150,"DRREDDY":125,"CIPLA":650,
+    "EICHERMOT":200,"DIVISLAB":200,"NESTLEIND":40,"ULTRACEMCO":100,
+}
+DEFAULT_LOT = 500
+
+_last_scan_result = {}
+
+def _atm_strike(iep, interval):
+    return round(round(iep / interval) * interval, 2)
+
+def _last_tuesday_of_month(year, month):
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    d = datetime.date(year, month, last_day)
+    while d.weekday() != 1:
+        d -= datetime.timedelta(days=1)
+    return d
+
+def _nearest_expiry_code():
+    today = datetime.date.today()
+    exp = _last_tuesday_of_month(today.year, today.month)
+    if exp < today:
+        if today.month == 12:
+            exp = _last_tuesday_of_month(today.year + 1, 1)
+        else:
+            exp = _last_tuesday_of_month(today.year, today.month + 1)
+    return exp.strftime("%y%m%d"), exp.strftime("%Y-%m-%d")
+
+def _liquidity_score(oi, volume, ltp):
+    s = 0
+    if oi    >= 10000: s += 4
+    elif oi  >=  1000: s += 2
+    elif oi  >=   100: s += 1
+    if volume >= 5000: s += 3
+    elif volume >= 500: s += 2
+    elif volume >= 50:  s += 1
+    if 5 <= ltp <= 200: s += 2
+    elif ltp <= 400:    s += 1
+    return min(s, 10)
+
+def _get_option_data(sym, atm, direction, expiry_iso):
+    if sym not in SYMBOL_MAP:
+        return None
+    try:
+        raw = dhan_post("/optionchain", {
+            "UnderlyingScrip": SYMBOL_MAP[sym]["scrip_code"],
+            "UnderlyingSeg":   SYMBOL_MAP[sym]["segment"],
+            "Expiry":          expiry_iso,
+        })
+        spot, rows = parse_chain(raw, sym)
+        if not rows:
+            return None
+
+        strikes = sorted(set(r["strike"] for r in rows))
+        nearest = min(strikes, key=lambda x: abs(x - atm))
+        diffs = [strikes[i+1]-strikes[i] for i in range(len(strikes)-1)]
+        iv_guess = min(diffs) if diffs else 0
+
+        candidates = [nearest]
+        if iv_guess > 0:
+            if direction == "CALL":
+                candidates += [nearest + iv_guess, nearest + 2*iv_guess]
+            else:
+                candidates += [nearest - iv_guess, nearest - 2*iv_guess]
+
+        row_map = {r["strike"]: r for r in rows}
+
+        for c in candidates:
+            best_k = min(row_map.keys(), key=lambda x: abs(x - c))
+            r = row_map[best_k]
+            ltp    = r["ce_ltp"]    if direction == "CALL" else r["pe_ltp"]
+            oi_val = r["ce_oi"]     if direction == "CALL" else r["pe_oi"]
+            volume = r["ce_volume"] if direction == "CALL" else r["pe_volume"]
+            iv     = r["ce_iv"]     if direction == "CALL" else r["pe_iv"]
+
+            if ltp < 5 or ltp > 500 or oi_val < 100:
+                continue
+
+            lots      = LOT_SIZES.get(sym, DEFAULT_LOT)
+            cost_lot  = round(ltp * lots, 2)
+            max_risk  = 50000 * 0.30
+            affordable= int(max_risk // cost_lot) if cost_lot else 0
+            bep       = round((r["ce_ltp"] + r["pe_ltp"]) / 2, 2)
+            lscore    = _liquidity_score(oi_val, volume, ltp)
+
+            return {
+                "strike":         best_k,
+                "ltp":            ltp,
+                "oi":             oi_val,
+                "volume":         volume,
+                "iv":             iv,
+                "ce_ltp":         r["ce_ltp"],
+                "pe_ltp":         r["pe_ltp"],
+                "bep":            bep,
+                "liquidity":      lscore,
+                "lot_size":       lots,
+                "cost_per_lot":   cost_lot,
+                "lots_affordable":affordable,
+                "max_loss_rs":    int(affordable * cost_lot),
+                "target_2x_rs":   int(affordable * cost_lot * 2),
+                "sl_price":       round(ltp * 0.5, 2),
+                "flag":           "OK" if lscore >= 4 else "LOW_LIQ",
+            }
+        return None
+    except Exception:
+        return None
+
+def _parse_bhav_csv(content: str) -> dict:
+    result = {}
+    reader = csv.reader(io.StringIO(content))
+    header = [h.strip().upper() for h in next(reader)]
+    sym_i  = next((i for i,h in enumerate(header) if "SYMBOL" in h), 0)
+    hi_i   = next((i for i,h in enumerate(header) if "HIGH"   in h and "PRICE" in h), 5)
+    lo_i   = next((i for i,h in enumerate(header) if "LOW"    in h and "PRICE" in h), 6)
+    cl_i   = next((i for i,h in enumerate(header) if "CLOSE"  in h), 7)
+    for row in reader:
+        if len(row) <= max(sym_i, hi_i, lo_i):
+            continue
+        sym = row[sym_i].strip().strip('"')
+        try:
+            result[sym] = {
+                "HIGH":  float(row[hi_i].strip().replace(",","")),
+                "LOW":   float(row[lo_i].strip().replace(",","")),
+                "CLOSE": float(row[cl_i].strip().replace(",","")) if cl_i < len(row) else 0,
+            }
+        except (ValueError, IndexError):
+            pass
+    return result
+
+def _parse_premarket_csv(content: str) -> dict:
+    result = {}
+    reader = csv.reader(io.StringIO(content))
+    raw_h  = next(reader)
+    header = [h.strip().replace("\n","").replace("\r","").upper() for h in raw_h]
+    h_idx  = {col:i for i,col in enumerate(header)}
+    sym_i  = h_idx.get("SYMBOL", 0)
+    iep_i  = h_idx.get("IEP", 1)
+    pct_i  = h_idx.get("%CHNG", 2)
+    for row in reader:
+        if len(row) <= max(sym_i, iep_i, pct_i):
+            continue
+        sym = row[sym_i].strip().strip('"')
+        try:
+            result[sym] = {
+                "IEP": float(row[iep_i].strip().strip('"').replace(",","")),
+                "PCT": float(row[pct_i].strip().strip('"')),
+            }
+        except (ValueError, IndexError):
+            pass
+    return result
+
+@app.post("/api/gap-scan")
+async def gap_scan(
+    bhav_file:      UploadFile = File(...),
+    premarket_file: UploadFile = File(...),
+    min_gap_pct:    float      = Form(2.0),
+    capital:        int        = Form(50000),
+    risk_pct:       float      = Form(0.30),
+    fetch_ltp:      bool       = Form(True),
+):
+    global _last_scan_result
+
+    bhav_content = (await bhav_file.read()).decode("utf-8-sig")
+    pm_content   = (await premarket_file.read()).decode("utf-8-sig")
+
+    bhav      = _parse_bhav_csv(bhav_content)
+    premarket = _parse_premarket_csv(pm_content)
+
+    expiry_code, expiry_iso = _nearest_expiry_code()
+
+    gap_up, gap_down, excluded, no_interval, low_liq = [], [], [], [], []
+
+    for sym, pm in premarket.items():
+        pct = pm["PCT"]
+        iep = pm["IEP"]
+        bh  = bhav.get(sym)
+        if not bh:
+            continue
+
+        interval = STRIKE_INTERVALS.get(sym)
+        if not interval:
+            no_interval.append({"symbol": sym, "gap_pct": round(pct,2), "iep": iep})
+            continue
+
+        prev_high = bh["HIGH"]
+        prev_low  = bh["LOW"]
+        prev_close= bh.get("CLOSE", 0)
+
+        if pct >= min_gap_pct and iep > prev_high:
+            direction = "CALL"
+            atm = _atm_strike(iep, interval)
+            tv  = f"NSE:{sym}{expiry_code}C{int(atm)}"
+
+            sdata = _get_option_data(sym, atm, direction, expiry_iso) if fetch_ltp else None
+            if not sdata:
+                low_liq.append({"symbol": sym, "gap_pct": round(pct,2)})
+                time.sleep(0.35)
+
+            row = {
+                "symbol":          sym,
+                "direction":       "CALL",
+                "iep":             iep,
+                "gap_pct":         round(pct,2),
+                "prev_high":       prev_high,
+                "prev_low":        None,
+                "prev_close":      prev_close,
+                "strike_interval": interval,
+                "atm_strike":      sdata["strike"] if sdata else atm,
+                "tv_symbol":       tv if not sdata else f"NSE:{sym}{expiry_code}C{int(sdata['strike'])}",
+                "ce_ltp":          sdata["ce_ltp"]         if sdata else 0,
+                "pe_ltp":          sdata["pe_ltp"]         if sdata else 0,
+                "ltp":             sdata["ltp"]            if sdata else 0,
+                "bep":             sdata["bep"]            if sdata else 0,
+                "oi":              sdata["oi"]             if sdata else 0,
+                "volume":          sdata["volume"]         if sdata else 0,
+                "iv_pct":          sdata["iv"]             if sdata else 0,
+                "liquidity":       sdata["liquidity"]      if sdata else 0,
+                "lot_size":        sdata["lot_size"]       if sdata else LOT_SIZES.get(sym, DEFAULT_LOT),
+                "cost_per_lot":    sdata["cost_per_lot"]   if sdata else 0,
+                "lots_affordable": sdata["lots_affordable"]if sdata else 0,
+                "max_loss_rs":     sdata["max_loss_rs"]    if sdata else 0,
+                "target_2x_rs":    sdata["target_2x_rs"]  if sdata else 0,
+                "sl_price":        sdata["sl_price"]       if sdata else 0,
+                "flag":            sdata["flag"]           if sdata else "NO_DATA",
+                "gap_tier":        "POWER" if pct>=5 else "STRONG" if pct>=3 else "NORMAL",
+                "entry_condition": iep > prev_high,
+            }
+            gap_up.append(row)
+
+        elif pct <= -min_gap_pct and iep < prev_low:
+            direction = "PUT"
+            atm = _atm_strike(iep, interval)
+            tv  = f"NSE:{sym}{expiry_code}P{int(atm)}"
+
+            sdata = _get_option_data(sym, atm, direction, expiry_iso) if fetch_ltp else None
+            if not sdata:
+                low_liq.append({"symbol": sym, "gap_pct": round(pct,2)})
+                time.sleep(0.35)
+
+            row = {
+                "symbol":          sym,
+                "direction":       "PUT",
+                "iep":             iep,
+                "gap_pct":         round(pct,2),
+                "prev_high":       None,
+                "prev_low":        prev_low,
+                "prev_close":      prev_close,
+                "strike_interval": interval,
+                "atm_strike":      sdata["strike"] if sdata else atm,
+                "tv_symbol":       tv if not sdata else f"NSE:{sym}{expiry_code}P{int(sdata['strike'])}",
+                "ce_ltp":          sdata["ce_ltp"]         if sdata else 0,
+                "pe_ltp":          sdata["pe_ltp"]         if sdata else 0,
+                "ltp":             sdata["ltp"]            if sdata else 0,
+                "bep":             sdata["bep"]            if sdata else 0,
+                "oi":              sdata["oi"]             if sdata else 0,
+                "volume":          sdata["volume"]         if sdata else 0,
+                "iv_pct":          sdata["iv"]             if sdata else 0,
+                "liquidity":       sdata["liquidity"]      if sdata else 0,
+                "lot_size":        sdata["lot_size"]       if sdata else LOT_SIZES.get(sym, DEFAULT_LOT),
+                "cost_per_lot":    sdata["cost_per_lot"]   if sdata else 0,
+                "lots_affordable": sdata["lots_affordable"]if sdata else 0,
+                "max_loss_rs":     sdata["max_loss_rs"]    if sdata else 0,
+                "target_2x_rs":    sdata["target_2x_rs"]  if sdata else 0,
+                "sl_price":        sdata["sl_price"]       if sdata else 0,
+                "flag":            sdata["flag"]           if sdata else "NO_DATA",
+                "gap_tier":        "POWER" if abs(pct)>=5 else "STRONG" if abs(pct)>=3 else "NORMAL",
+                "entry_condition": iep < prev_low,
+            }
+            gap_down.append(row)
+
+        elif abs(pct) >= min_gap_pct:
+            excluded.append({
+                "symbol": sym, "gap_pct": round(pct,2), "iep": iep,
+                "prev_high": prev_high, "prev_low": prev_low,
+                "reason": "IEP did not break prev high/low",
+            })
+
+    gap_up.sort(key=lambda x: (-x["gap_pct"], -x["liquidity"]))
+    gap_down.sort(key=lambda x: (x["gap_pct"], -x["liquidity"]))
+
+    watchlist_txt = "# GAP UP CALLS\n"
+    for r in gap_up:
+        tag = "" if r["flag"] == "OK" else "  # verify liquidity"
+        watchlist_txt += f"{r['tv_symbol']},{tag}\n"
+    watchlist_txt += "\n# GAP DOWN PUTS\n"
+    for r in gap_down:
+        tag = "" if r["flag"] == "OK" else "  # verify liquidity"
+        watchlist_txt += f"{r['tv_symbol']},{tag}\n"
+
+    result = {
+        "scan_time":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "expiry_code":     expiry_code,
+        "expiry_iso":      expiry_iso,
+        "total_gap_up":    len(gap_up),
+        "total_gap_down":  len(gap_down),
+        "top_picks":       [r for r in (gap_up + gap_down) if r["flag"] == "OK" and r["lots_affordable"] >= 1],
+        "gap_up":          gap_up,
+        "gap_down":        gap_down,
+        "excluded":        excluded[:20],
+        "no_interval":     no_interval[:20],
+        "low_liquidity":   low_liq[:20],
+        "watchlist_txt":   watchlist_txt,
+        "capital":         capital,
+        "risk_pct":        risk_pct,
+    }
+
+    _last_scan_result = result
+    return result
+
+@app.get("/api/gap-scan/last")
+def get_last_scan():
+    if not _last_scan_result:
+        raise HTTPException(404, "No scan run yet. POST to /api/gap-scan first.")
+    return _last_scan_result
+
+@app.get("/api/gap-scan/watchlist")
+def get_watchlist():
+    if not _last_scan_result:
+        raise HTTPException(404, "No scan run yet.")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(_last_scan_result.get("watchlist_txt",""), media_type="text/plain")
