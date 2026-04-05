@@ -1,0 +1,22 @@
+# Credentials
+dhan_api_server.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
