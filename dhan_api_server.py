@@ -655,7 +655,7 @@ def _parse_premarket_csv(content: str) -> dict:
     h_idx  = {col:i for i,col in enumerate(header)}
     sym_i  = h_idx.get("SYMBOL", 0)
     iep_i  = h_idx.get("IEP", 1)
-    pct_i  = h_idx.get("%CHNG", 2)
+    pct_i  = next((i for i, h in enumerate(header) if "CHNG" in h and "%" in h), 2)
     for row in reader:
         if len(row) <= max(sym_i, iep_i, pct_i):
             continue
@@ -839,3 +839,242 @@ def get_watchlist():
         raise HTTPException(404, "No scan run yet.")
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(_last_scan_result.get("watchlist_txt",""), media_type="text/plain")
+
+
+# ══════════════════════════════════════════════════════════════════
+# AUTO GAP SCAN
+# ══════════════════════════════════════════════════════════════════
+
+NSE_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Referer":         "https://www.nseindia.com/",
+}
+
+def _get_nse_session():
+    """Create a requests session with NSE cookies."""
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
+    try:
+        s.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1)
+        s.get("https://www.nseindia.com/market-data/pre-open-market-fno", timeout=15)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    return s
+
+def _prev_trading_day():
+    """Return previous trading day as DDMMYYYY string."""
+    d = datetime.date.today() - datetime.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d.strftime("%d%m%Y"), d
+
+def _download_bhav(session=None):
+    """Download NSE bhav copy for previous trading day."""
+    date_str, date_obj = _prev_trading_day()
+    url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+    headers = dict(NSE_HEADERS)
+    headers["Referer"] = "https://www.nseindia.com/"
+    try:
+        if session:
+            resp = session.get(url, timeout=20)
+        else:
+            resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return None, f"Bhav copy not found for {date_str} (HTTP {resp.status_code})"
+        content = resp.content.decode("utf-8-sig")
+        return _parse_bhav_csv(content), None
+    except Exception as e:
+        return None, f"Bhav download failed: {str(e)}"
+
+def _download_premarket(session=None):
+    """Download NSE pre-market F&O data via NSE API."""
+    url = "https://www.nseindia.com/api/market-data-pre-open?key=FO"
+    try:
+        if session:
+            resp = session.get(url, timeout=20)
+        else:
+            s = _get_nse_session()
+            resp = s.get(url, timeout=20)
+        if resp.status_code != 200:
+            return None, f"Pre-market API returned HTTP {resp.status_code}"
+        data = resp.json()
+        items = data.get("data", [])
+        if not items:
+            return None, "Pre-market data is empty — market may not have opened yet"
+        result = {}
+        for item in items:
+            meta = item.get("metadata", {})
+            sym  = meta.get("symbol", "").strip()
+            iep  = meta.get("iep", 0)
+            pct  = meta.get("pChange", 0)
+            if sym and iep:
+                try:
+                    result[sym] = {
+                        "IEP": float(str(iep).replace(",", "")),
+                        "PCT": float(str(pct).replace(",", "")),
+                    }
+                except (ValueError, TypeError):
+                    pass
+        return result, None
+    except Exception as e:
+        return None, f"Pre-market download failed: {str(e)}"
+
+@app.get("/api/gap-scan/auto")
+async def auto_gap_scan(
+    min_gap_pct: float = 2.0,
+    capital:     int   = 50000,
+    risk_pct:    float = 0.30,
+    fetch_ltp:   bool  = True,
+):
+    """
+    Fully automatic gap scan — no file uploads needed.
+    Automatically downloads previous day Bhav Copy + today's pre-market data from NSE.
+    Best called between 9:05 AM and 9:08 AM IST.
+    """
+    global _last_scan_result
+
+    session = _get_nse_session()
+    bhav, bhav_err = _download_bhav(session)
+    if bhav_err:
+        raise HTTPException(503, f"Bhav Copy Error: {bhav_err}")
+
+    premarket, pm_err = _download_premarket(session)
+    if pm_err:
+        raise HTTPException(503, f"Pre-Market Error: {pm_err}")
+
+    expiry_code, expiry_iso = _nearest_expiry_code()
+    gap_up, gap_down, excluded, no_interval, low_liq = [], [], [], [], []
+    date_str, prev_date = _prev_trading_day()
+
+    for sym, pm in premarket.items():
+        pct = pm["PCT"]
+        iep = pm["IEP"]
+        bh  = bhav.get(sym)
+        if not bh:
+            continue
+
+        interval = STRIKE_INTERVALS.get(sym)
+        if not interval:
+            no_interval.append({"symbol": sym, "gap_pct": round(pct, 2), "iep": iep})
+            continue
+
+        prev_high  = bh["HIGH"]
+        prev_low   = bh["LOW"]
+        prev_close = bh.get("CLOSE", 0)
+
+        if pct >= min_gap_pct and iep > prev_high:
+            atm   = _atm_strike(iep, interval)
+            tv    = f"NSE:{sym}{expiry_code}C{int(atm)}"
+            sdata = _get_option_data(sym, atm, "CALL", expiry_iso) if fetch_ltp else None
+            if not sdata:
+                low_liq.append({"symbol": sym, "gap_pct": round(pct, 2)})
+            else:
+                time.sleep(0.35)
+            gap_up.append({
+                "symbol": sym, "direction": "CALL", "iep": iep,
+                "gap_pct": round(pct, 2), "prev_high": prev_high,
+                "prev_low": None, "prev_close": prev_close,
+                "strike_interval": interval,
+                "atm_strike":      sdata["strike"]         if sdata else atm,
+                "tv_symbol":       f"NSE:{sym}{expiry_code}C{int(sdata['strike'])}" if sdata else tv,
+                "ce_ltp":          sdata["ce_ltp"]         if sdata else 0,
+                "pe_ltp":          sdata["pe_ltp"]         if sdata else 0,
+                "ltp":             sdata["ltp"]            if sdata else 0,
+                "bep":             sdata["bep"]            if sdata else 0,
+                "oi":              sdata["oi"]             if sdata else 0,
+                "volume":          sdata["volume"]         if sdata else 0,
+                "iv_pct":          sdata["iv"]             if sdata else 0,
+                "liquidity":       sdata["liquidity"]      if sdata else 0,
+                "lot_size":        sdata["lot_size"]       if sdata else LOT_SIZES.get(sym, DEFAULT_LOT),
+                "cost_per_lot":    sdata["cost_per_lot"]   if sdata else 0,
+                "lots_affordable": sdata["lots_affordable"]if sdata else 0,
+                "max_loss_rs":     sdata["max_loss_rs"]    if sdata else 0,
+                "target_2x_rs":    sdata["target_2x_rs"]  if sdata else 0,
+                "sl_price":        sdata["sl_price"]       if sdata else 0,
+                "flag":            sdata["flag"]           if sdata else "NO_DATA",
+                "gap_tier":        "POWER" if pct>=5 else "STRONG" if pct>=3 else "NORMAL",
+                "entry_condition": iep > prev_high,
+            })
+
+        elif pct <= -min_gap_pct and iep < prev_low:
+            atm   = _atm_strike(iep, interval)
+            tv    = f"NSE:{sym}{expiry_code}P{int(atm)}"
+            sdata = _get_option_data(sym, atm, "PUT", expiry_iso) if fetch_ltp else None
+            if not sdata:
+                low_liq.append({"symbol": sym, "gap_pct": round(pct, 2)})
+            else:
+                time.sleep(0.35)
+            gap_down.append({
+                "symbol": sym, "direction": "PUT", "iep": iep,
+                "gap_pct": round(pct, 2), "prev_high": None,
+                "prev_low": prev_low, "prev_close": prev_close,
+                "strike_interval": interval,
+                "atm_strike":      sdata["strike"]         if sdata else atm,
+                "tv_symbol":       f"NSE:{sym}{expiry_code}P{int(sdata['strike'])}" if sdata else tv,
+                "ce_ltp":          sdata["ce_ltp"]         if sdata else 0,
+                "pe_ltp":          sdata["pe_ltp"]         if sdata else 0,
+                "ltp":             sdata["ltp"]            if sdata else 0,
+                "bep":             sdata["bep"]            if sdata else 0,
+                "oi":              sdata["oi"]             if sdata else 0,
+                "volume":          sdata["volume"]         if sdata else 0,
+                "iv_pct":          sdata["iv"]             if sdata else 0,
+                "liquidity":       sdata["liquidity"]      if sdata else 0,
+                "lot_size":        sdata["lot_size"]       if sdata else LOT_SIZES.get(sym, DEFAULT_LOT),
+                "cost_per_lot":    sdata["cost_per_lot"]   if sdata else 0,
+                "lots_affordable": sdata["lots_affordable"]if sdata else 0,
+                "max_loss_rs":     sdata["max_loss_rs"]    if sdata else 0,
+                "target_2x_rs":    sdata["target_2x_rs"]  if sdata else 0,
+                "sl_price":        sdata["sl_price"]       if sdata else 0,
+                "flag":            sdata["flag"]           if sdata else "NO_DATA",
+                "gap_tier":        "POWER" if abs(pct)>=5 else "STRONG" if abs(pct)>=3 else "NORMAL",
+                "entry_condition": iep < prev_low,
+            })
+
+        elif abs(pct) >= min_gap_pct:
+            excluded.append({
+                "symbol": sym, "gap_pct": round(pct, 2), "iep": iep,
+                "prev_high": prev_high, "prev_low": prev_low,
+                "reason": "IEP did not break prev high/low",
+            })
+
+    gap_up.sort(key=lambda x: (-x["gap_pct"], -x["liquidity"]))
+    gap_down.sort(key=lambda x: (x["gap_pct"], -x["liquidity"]))
+
+    watchlist_txt = "# GAP UP CALLS\n"
+    for r in gap_up:
+        tag = "" if r["flag"] == "OK" else "  # verify liquidity"
+        watchlist_txt += f"{r['tv_symbol']},{tag}\n"
+    watchlist_txt += "\n# GAP DOWN PUTS\n"
+    for r in gap_down:
+        tag = "" if r["flag"] == "OK" else "  # verify liquidity"
+        watchlist_txt += f"{r['tv_symbol']},{tag}\n"
+
+    result = {
+        "scan_time":        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source":          "AUTO (NSE direct download)",
+        "bhav_date":       prev_date.strftime("%Y-%m-%d"),
+        "bhav_symbols":    len(bhav),
+        "premarket_symbols": len(premarket),
+        "expiry_code":     expiry_code,
+        "expiry_iso":      expiry_iso,
+        "total_gap_up":    len(gap_up),
+        "total_gap_down":  len(gap_down),
+        "top_picks":       [r for r in (gap_up + gap_down) if r["flag"] == "OK" and r["lots_affordable"] >= 1],
+        "gap_up":          gap_up,
+        "gap_down":        gap_down,
+        "excluded":        excluded[:20],
+        "no_interval":     no_interval[:20],
+        "low_liquidity":   low_liq[:20],
+        "watchlist_txt":   watchlist_txt,
+        "capital":         capital,
+        "risk_pct":        risk_pct,
+    }
+
+    _last_scan_result = result
+    return result
