@@ -857,13 +857,41 @@ async def gap_scan(
     }
 
     _last_scan_result = result
+    try:
+        with open("last_gap_scan.json", "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
     return result
 
 @app.get("/api/gap-scan/last")
 def get_last_scan():
-    if not _last_scan_result:
-        raise HTTPException(404, "No scan run yet. POST to /api/gap-scan first.")
-    return _last_scan_result
+    """Return last scan result — empty response if no scan has run yet."""
+    import json
+    result_file = "last_gap_scan.json"
+    if not os.path.exists(result_file):
+        return {
+            "scan_time": None,
+            "total_gap_up": 0,
+            "total_gap_down": 0,
+            "top_picks": [],
+            "gap_up": [],
+            "gap_down": [],
+            "excluded": [],
+            "message": "No scan results yet. Auto-scan fires at 9:09 AM IST weekdays."
+        }
+    try:
+        with open(result_file, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {
+            "scan_time": None,
+            "top_picks": [],
+            "gap_up": [],
+            "gap_down": [],
+            "excluded": [],
+            "message": f"Error reading scan: {str(e)}"
+        }
 
 @app.get("/api/gap-scan/watchlist")
 def get_watchlist():
@@ -1109,4 +1137,9 @@ async def auto_gap_scan(
     }
 
     _last_scan_result = result
+    try:
+        with open("last_gap_scan.json", "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
     return result
